@@ -1,0 +1,193 @@
+// =========================================
+// SIMULAÇÃO DE CONEXÃO WI-FI PARA ESP-IDF
+// =========================================
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"
+#include "esp_random.h"
+
+#define WIFI_SCAN_INTERVAL_MS   2000
+#define QUEUE_SIZE              5
+#define SSID_MAX_LEN            33
+
+static const char *TAG = "SIM_WIFI";
+
+QueueHandle_t xQueueWiFi;
+QueueHandle_t xQueueAlert;
+SemaphoreHandle_t xMutexSafeList;
+
+// =====================
+// LISTA DE REDES SEGURAS
+// =====================
+const char* redesSeguras[] = {
+    "EmpresaA_24G",
+    "EmpresaA_5G",
+    "Laboratorio_Redes",
+    "TI_Segura",
+    "Backup_AP"
+};
+const int NUM_REDES_SEGURAS = 5;
+
+// ==========================
+// SIMULAÇÃO DE WIFI
+// ==========================
+
+const char* redesFake[] = {
+    "EmpresaA_24G",
+    "EmpresaA_5G",
+    "Laboratorio_Redes",
+    "Rede_Pirataria",
+    "HackerZone_5G",
+    "TI_Segura",
+    "Backup_AP",
+    "FreeWifi",
+    "Desconhecida_01",
+    "Invasor_Pro"
+};
+const int NUM_REDES_FAKE = 10;
+
+bool wifiConectado = false;
+
+void iniciarWifiSimulado()
+{
+    ESP_LOGI(TAG, "Simulando conexão Wi-Fi...");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    wifiConectado = true;
+    ESP_LOGI(TAG, "WiFi SIMULADO conectado.");
+}
+
+bool fakeIsConnected() {
+    return wifiConectado;
+}
+
+const char* fakeSSID() {
+    int r = esp_random() % NUM_REDES_FAKE;
+    return redesFake[r];
+}
+
+// =====================
+// FUNÇÃO AUXILIAR
+// =====================
+bool redeEhSegura(const char* ssid) {
+    for (int i = 0; i < NUM_REDES_SEGURAS; i++) {
+        if (strcmp(ssid, redesSeguras[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// =====================
+// TASK: WiFi Scanner
+// =====================
+void Task_WiFiScanner(void *pvParameters)
+{
+    esp_task_wdt_add(NULL);
+
+    char ssidAtual[SSID_MAX_LEN];
+
+    for (;;) {
+        esp_task_wdt_reset();
+
+        if (fakeIsConnected()) {
+
+            const char* ssidFake = fakeSSID();
+            strncpy(ssidAtual, ssidFake, SSID_MAX_LEN);
+
+            ESP_LOGI(TAG, "SSID detectado: %s", ssidAtual);
+
+            if (xQueueSend(xQueueWiFi, &ssidAtual, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Fila WiFi cheia. SSID descartado.");
+            }
+        } else {
+            ESP_LOGI(TAG, "Dispositivo não conectado (SIMULADO).");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_INTERVAL_MS));
+    }
+}
+
+// =====================
+// TASK: Segurança
+// =====================
+void Task_SecurityCheck(void *pvParameters)
+{
+    char ssidRecebido[SSID_MAX_LEN];
+
+    for (;;) {
+        if (xQueueReceive(xQueueWiFi, &ssidRecebido, portMAX_DELAY)) {
+
+            if (xSemaphoreTake(xMutexSafeList, pdMS_TO_TICKS(100)) == pdTRUE) {
+
+                bool segura = redeEhSegura(ssidRecebido);
+                xSemaphoreGive(xMutexSafeList);
+
+                if (!segura) {
+                    if (xQueueSend(xQueueAlert, &ssidRecebido, 0) != pdTRUE) {
+                        ESP_LOGE(TAG, "Fila de alertas cheia! ALERTA PERDIDO.");
+                    }
+                }
+
+            } else {
+                ESP_LOGE(TAG, "Timeout no acesso à lista de redes seguras.");
+            }
+        }
+    }
+}
+
+// =====================
+// TASK: Alertas
+// =====================
+void Task_AlertManager(void *pvParameters)
+{
+    char ssidAlvo[SSID_MAX_LEN];
+
+    for (;;) {
+        if (xQueueReceive(xQueueAlert, &ssidAlvo, portMAX_DELAY)) {
+            ESP_LOGE(TAG,
+                "\n=====================================\n"
+                " ⚠ ALERTA DE SEGURANÇA DETECTADO ⚠\n"
+                " Rede não autorizada: %s\n"
+                "=====================================\n",
+                ssidAlvo
+            );
+        }
+    }
+}
+
+// =====================
+// SETUP (main da ESP-IDF)
+// =====================
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Inicializando sistema FreeRTOS (SIMULADO)...");
+
+    iniciarWifiSimulado();
+
+    xQueueWiFi  = xQueueCreate(QUEUE_SIZE, SSID_MAX_LEN);
+    xQueueAlert = xQueueCreate(QUEUE_SIZE, SSID_MAX_LEN);
+
+    xMutexSafeList = xSemaphoreCreateMutex();
+
+    esp_task_wdt_config_t wdt = {
+        .timeout_ms = 5000,
+        .idle_core_mask = (1 << 0) | (1 << 1),
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt);
+
+    xTaskCreatePinnedToCore(Task_WiFiScanner,   "WiFiScanner", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(Task_SecurityCheck, "SecurityChk", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(Task_AlertManager,  "AlertMgr",    4096, NULL, 1, NULL, 1);
+
+    ESP_LOGI(TAG, "Sistema SIMULADO iniciado!");
+}
